@@ -207,12 +207,16 @@ module Lease = struct
   type database = {
     id_map : t Id_map.t;
     addr_map : t Addr_map.t;
+    reservations : (Ipaddr.V4.t * int32 * string) list;
+    f : Macaddr.t -> string;
   } (* with sexp *)
 
-  let update_db id_map addr_map =
-    { id_map; addr_map }
+  let update_db id_map addr_map reservations f =
+    { id_map; addr_map ; reservations ; f }
 
-  let make_db () = update_db Id_map.empty Addr_map.empty
+  let make_db () = update_db Id_map.empty Addr_map.empty [] (fun _ -> "")
+
+  let add_reservations db f reservations = { db with f ; reservations }
 
   let to_list db = Id_map.fold (fun _id lease l -> lease :: l) db.id_map []
 
@@ -248,6 +252,7 @@ module Lease = struct
     update_db
       (Id_map.filter (fun _ lease -> not (expired lease ~now)) db.id_map)
       (Addr_map.filter (fun _ lease -> not (expired lease ~now)) db.addr_map)
+      db.reservations db.f
 
   let lease_of_client_id client_id db = Util.find_some @@ fun () ->
     Id_map.find client_id db.id_map
@@ -259,6 +264,7 @@ module Lease = struct
     update_db
       (Id_map.remove lease.client_id db.id_map)
       (Addr_map.remove lease.addr db.addr_map)
+      db.reservations db.f
 
   let replace lease db =
     (* First clear both maps *)
@@ -274,11 +280,18 @@ module Lease = struct
     update_db
       (Id_map.add lease.client_id lease clr_map.id_map)
       (Addr_map.add lease.addr lease clr_map.addr_map)
+      db.reservations db.f
 
-  let addr_allocated addr db =
-    Util.true_if_some @@ lease_of_addr addr db
+  let addr_allocated addr db ~now =
+    match List.find_opt (fun (addr', _, _) -> Ipaddr.V4.compare addr addr' = 0) db.reservations with
+    | Some (_, until, _) when until < now -> true
+    | Some _ | None -> Util.true_if_some @@ lease_of_addr addr db
 
-  let addr_available addr db ~now =
+  (* needs to check reservations (depend on mac address!) *)
+  let addr_available addr mac db ~now =
+    (match List.find_opt (fun (addr', _, _) -> Ipaddr.V4.compare addr addr' = 0) db.reservations with
+     | None -> true
+     | Some (_, until, h) -> now > until || String.equal (db.f mac) h) &&
     match lease_of_addr addr db with
     | None -> true
     | Some lease -> expired lease ~now
@@ -287,7 +300,12 @@ module Lease = struct
  * We try to use the last 4 bytes of the mac address as a hint for the ip
  * address, if that fails, we try a linear search.
  *)
-  let get_usable_addr id db range ~now =
+  (* take mac address as input, and if hash is found (+ still free), pick that IP *)
+  let get_usable_addr mac id db range ~now =
+    let h = db.f mac in
+    match List.find_opt (fun (_, _, h') -> String.equal h h') db.reservations with
+    | Some (ip, until, _) when now < until -> Some ip
+    | Some _ | None ->
     match range with
     | None -> None
     | Some range ->
@@ -322,11 +340,11 @@ module Lease = struct
       else
         linear_loop (Int32.succ off) f
     in
-    if not (addr_allocated hint_ip db) then
+    if not (addr_allocated ~now hint_ip db) then
       Some hint_ip
-    else match linear_loop Int32.zero (fun a -> not (addr_allocated a db)) with
+    else match linear_loop Int32.zero (fun a -> not (addr_allocated ~now a db)) with
       | Some ip -> Some ip
-      | None -> linear_loop Int32.zero (fun a -> addr_available a db ~now)
+      | None -> linear_loop Int32.zero (fun a -> addr_available a mac db ~now)
 
 end
 
@@ -812,14 +830,14 @@ module Input = struct
         (match lease with
          | Some lease ->
            if Lease.expired lease ~now &&
-              not (Lease.addr_available reqip db ~now) then
+              not (Lease.addr_available reqip pkt.srcmac db ~now) then
              nak ~msg:"Lease has expired and address is taken" ()
            else if lease.Lease.addr <> reqip then
              nak ~msg:"Requested address is incorrect" ()
            else
              ack ~renew:true lease
          | None ->
-           if not (Lease.addr_available reqip db ~now) then
+           if not (Lease.addr_available reqip pkt.srcmac db ~now) then
              nak ~msg:"Requested address is not available" ()
            else
              ack (Lease.make client_id reqip
@@ -828,7 +846,7 @@ module Input = struct
       if pkt.ciaddr <> Ipaddr.V4.unspecified then (* violates RFC2131 4.3.2 *)
         bad_packet "Bad DHCPREQUEST, ciaddr is not 0"
       else if Lease.expired lease ~now &&
-              not (Lease.addr_available reqip db ~now) then
+              not (Lease.addr_available reqip pkt.srcmac db ~now) then
         nak ~msg:"Lease has expired and address is taken" ()
         (* TODO check if it's in the correct network when giaddr <> 0 *)
       else if pkt.giaddr = Ipaddr.V4.unspecified &&
@@ -842,7 +860,7 @@ module Input = struct
       if pkt.ciaddr = Ipaddr.V4.unspecified then (* violates RFC2131 4.3.2 renewal *)
         bad_packet "Bad DHCPREQUEST, ciaddr is not 0"
       else if Lease.expired lease ~now &&
-              not (Lease.addr_available lease.Lease.addr db ~now) then
+              not (Lease.addr_available lease.Lease.addr pkt.srcmac db ~now) then
         nak ~msg:"Lease has expired and address is taken" ()
       else if lease.Lease.addr <> pkt.ciaddr then
         nak ~msg:"Requested address is incorrect" ()
@@ -858,19 +876,19 @@ module Input = struct
       if not (Lease.expired lease ~now) then
         Some lease.Lease.addr
         (* If the lease expired, the address might not be available *)
-      else if (Lease.addr_available lease.Lease.addr db ~now) then
+      else if (Lease.addr_available lease.Lease.addr pkt.srcmac db ~now) then
         Some lease.Lease.addr
       else
-        Lease.get_usable_addr id db config.range ~now
+        Lease.get_usable_addr pkt.srcmac id db config.range ~now
     (* Handle the case where we have no lease *)
     | None -> match (find_request_ip pkt.options) with
       | Some req_addr ->
         if (good_address config pkt.chaddr req_addr db) &&
-           (Lease.addr_available req_addr db ~now) then
+           (Lease.addr_available req_addr pkt.srcmac db ~now) then
           Some req_addr
         else
-          Lease.get_usable_addr id db config.range ~now
-      | None -> Lease.get_usable_addr id db config.range ~now
+          Lease.get_usable_addr pkt.srcmac id db config.range ~now
+      | None -> Lease.get_usable_addr pkt.srcmac id db config.range ~now
 
   let discover_lease_time config lease _db pkt now =
     match (find_ip_lease_time pkt.options) with
