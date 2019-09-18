@@ -357,7 +357,7 @@ module Input = struct
   type result =
     | Silence
     | Update of Lease.database
-    | Reply of Dhcp_wire.pkt * Lease.database * (Ipaddr.V4.t * string) option
+    | Reply of Dhcp_wire.pkt * Lease.database * (Ipaddr.V4.t * string option) option
     | Warning of string
     | Error of string
 
@@ -808,10 +808,7 @@ module Input = struct
           ~ciaddr:pkt.ciaddr ~yiaddr:lease.Lease.addr
           ~siaddr:ourip ~giaddr:pkt.giaddr options
       in
-      let ipname = match find_hostname pkt.options with
-        | None -> None
-        | Some str -> Some (lease.Lease.addr, str)
-      in
+      let ipname = Some (lease.Lease.addr, find_hostname pkt.options) in
       if not fixed_lease then
         let () = assert (lease.Lease.client_id = client_id) in
         Reply (reply, Lease.replace lease db, ipname)
