@@ -284,8 +284,8 @@ module Lease = struct
 
   let addr_allocated addr db ~now =
     match List.find_opt (fun (addr', _, _) -> Ipaddr.V4.compare addr addr' = 0) db.reservations with
-    | Some (_, until, _) when until < now -> true
-    | Some _ | None -> Util.true_if_some @@ lease_of_addr addr db
+    | Some (_, until, _) -> until >= now
+    | None -> Util.true_if_some @@ lease_of_addr addr db
 
   (* needs to check reservations (depend on mac address!) *)
   let addr_available addr mac db ~now =
